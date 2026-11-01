@@ -1,33 +1,23 @@
 package io.github.rvbcrs.wallmode
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.app.ActivityManager
-import android.os.BatteryManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
-import android.hardware.camera2.CaptureRequest
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
-import android.util.Range
-import android.util.Size
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -46,19 +36,14 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.textfield.TextInputEditText
@@ -80,8 +65,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Calendar
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
@@ -97,7 +80,7 @@ private data class ActiveEventTakeover(
     val webContentReplaced: Boolean
 )
 
-class MainActivity : AppCompatActivity(), SensorEventListener {
+class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: KioskPreferences
     private lateinit var announcementSpeaker: AnnouncementSpeaker
@@ -122,21 +105,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var autoDiscoveryJob: Job? = null
     private var screensaverWeatherJob: Job? = null
     private var ambientBackgroundJob: Job? = null
-    private var mqttStateJob: Job? = null
     private var activeEventTakeover: ActiveEventTakeover? = null
     private var eventTakeoverTimeout: Runnable? = null
     private var pendingScheduledProfile = false
     private var activeDashboardProfile: DashboardProfile? = null
     private var localControlServer: LocalControlServer? = null
-    private var mqttManager: MqttManager? = null
+    private var mqttServiceRunning = false
     private var localControlServerPort = -1
     private var pendingPresenceWakePermissionRequest = false
     private var presenceWakePermissionAttempted = false
     private var pendingStartupCameraPermissionRequest = false
-    private var presenceWakeAnalysis: ImageAnalysis? = null
-    private var presenceWakeCameraProvider: ProcessCameraProvider? = null
-    private var presenceWakeExecutor: ExecutorService? = null
-    private var presenceWakeStartPending = false
+    private var presenceWakeServiceRunning = false
 
     private var tapCount = 0
     private var firstTapAt = 0L
@@ -144,18 +123,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var networkCallbackRegistered = false
     private var watchdogFailureCount = 0
     private var isAmbientDimmed = false
+    private var isScreenOff = false
     private var updateCheckInProgress = false
     private var autoDiscoveryAttempted = false
-    private var lastPresenceAnalysisAtMillis = 0L
-    private var lastPresenceWakeAtMillis: Long? = null
-    private var presenceWakeRequested = false
     private var consumeAmbientWakeGesture = false
     private var ambientBackgroundRequest = 0
     private var ambientTransitionGeneration = 0
     private val mainFrameLoadState = MainFrameLoadState()
-
-    private val presenceMotionDetector = MotionWakeDetector()
-    private val proximityWakeGate = ProximityWakeGate()
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -182,7 +156,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (cameraGranted) {
                     applyPresenceWakePolicy()
                 } else {
-                    stopPresenceWakePipeline()
+                    stopPresenceWakeService()
                     prefs.recordLastLoadStatus("Presence wake unavailable: camera permission denied")
                 }
             }
@@ -193,7 +167,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             applyWindowSettings()
             applySchedulers()
             refreshLocalControlServer()
-            refreshMqttManager()
+            refreshMqttService()
             if (result.resultCode == RESULT_OK &&
                 result.data?.getBooleanExtra(SettingsActivity.EXTRA_EXIT_APP, false) == true
             ) {
@@ -212,15 +186,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
 
-    private val sensorManager: SensorManager by lazy {
-        getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    }
-
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: android.net.Network) {
             mainHandler.post {
-                mqttManager?.retryInitialConnection()
-                publishMqttState()
+                publishDashboardState()
                 if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                     maybeAutoDiscoverAndConnect()
                 }
@@ -247,7 +216,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         getString(R.string.recovery_waiting)
                     )
                     scheduleRetry("Network lost")
-                    publishMqttState()
+                    publishDashboardState()
                 }
             }
         }
@@ -255,6 +224,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppVisibility.userExited = false
         presenceWakePermissionAttempted = savedInstanceState?.getBoolean(STATE_PRESENCE_PERMISSION_ATTEMPTED) ?: false
         prefs = KioskPreferences(this)
         announcementSpeaker = AnnouncementSpeaker(this)
@@ -262,18 +232,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         bannerOverlay = BannerOverlay(binding.root) { noticeId, actionId ->
-            mqttManager?.publishActionResponse(noticeId, actionId) == true
+            MqttBridge.publishActionResponse(noticeId, actionId)
         }
         restoreEventTakeover(savedInstanceState)
 
         WebView.setWebContentsDebuggingEnabled(false)
 
         setupAdminGesture()
+        collectWakeSignals()
+        collectMqttBridge()
         registerNetworkMonitoring()
         applyWindowSettings()
         maybePromptStartupCameraPermission()
         refreshLocalControlServer()
-        refreshMqttManager()
+        refreshMqttService()
         applySchedulers()
         if (!resumeEventTakeover()) loadDashboard()
         maybeRunAutoUpdateCheck()
@@ -288,12 +260,33 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         prefs.applyThemeMode()
+        maybeHandleWakeIntent(intent)
         applyWindowSettings()
         resetAmbientTimer()
         applyPresenceWakePolicy()
         refreshLocalControlServer()
-        refreshMqttManager()
+        refreshMqttService()
         maybeAutoDiscoverAndConnect()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        maybeHandleWakeIntent(intent)
+    }
+
+    /**
+     * Handles the wake intent sent by [PresenceWakeService] when it detects
+     * motion while the panel is off and the Activity was not foreground. The
+     * WakeSignals collector covers the already-running case; this covers a cold
+     * relaunch where the wake emission may have preceded us. Runs before the
+     * ambient timer reset so the turn-screen-on flags are applied while
+     * isScreenOff is still true.
+     */
+    private fun maybeHandleWakeIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_WAKE_FROM_MOTION, false) != true) return
+        intent.removeExtra(EXTRA_WAKE_FROM_MOTION)
+        if (isScreenOff) wakeScreenFromMotion()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -324,10 +317,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         autoDiscoveryJob?.cancel()
         stopAmbientBackground()
-        presenceWakeRequested = false
-        stopPresenceWakePipeline()
-        sensorManager.unregisterListener(this)
-        proximityWakeGate.reset()
+        // The presence-wake camera + proximity sensor now live in
+        // PresenceWakeService and intentionally keep running across onPause so
+        // motion detection survives a true screen-off (which pauses us).
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -371,19 +363,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         profileJob?.cancel()
         screensaverWeatherJob?.cancel()
         stopAmbientBackground()
-        mqttStateJob?.cancel()
         unregisterNetworkMonitoring()
         stopLocalControlServer()
-        mqttManager?.stop()
-        mqttManager = null
-        presenceWakeRequested = false
-        stopPresenceWakePipeline()
-        sensorManager.unregisterListener(this)
+        // MqttService is deliberately left running so MQTT stays connected while the
+        // screen is off (the Activity may be destroyed in that state). It will be
+        // stopped explicitly from exitKioskNow() or when the settings disable MQTT.
+        // PresenceWakeService is likewise left running for motion detection.
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         destroyWebView()
-        presenceWakeExecutor?.shutdown()
-        presenceWakeExecutor = null
     }
 
     private fun setupAdminGesture() {
@@ -400,6 +388,34 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 tapCount = 0
                 firstTapAt = 0
                 requestAdminAccess()
+            }
+        }
+    }
+
+    /**
+     * Collects wake events from [PresenceWakeService] (which runs the camera and
+     * proximity sensor even while the screen is off) and runs the UI-side wake
+     * reaction. STARTED is enough — a screen-off Activity is STARTED, not
+     * RESUMED, when the service relaunches us.
+     */
+    private fun collectWakeSignals() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                WakeSignals.wakeEvents.collect {
+                    onPresenceDetected()
+                }
+            }
+        }
+    }
+
+    /**
+     * Collects [MqttBridge] flows for the lifetime of the activity:
+     *  - Inbound commands from [MqttService] → [handleMqttCommand]
+     */
+    private fun collectMqttBridge() {
+        lifecycleScope.launch {
+            MqttBridge.commands.collect { cmd ->
+                handleMqttCommand(cmd)
             }
         }
     }
@@ -516,7 +532,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         binding.webView.stopLoading()
         applyWebEngineProfile(settings)
         binding.webView.loadUrl(url)
-        publishMqttState()
+        publishDashboardState()
     }
 
     private fun maybeAutoDiscoverAndConnect() {
@@ -592,10 +608,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             return@runOnUiThread
                         }
 
+                        // Presence wake owns the camera for motion detection. A
+                        // single-camera device cannot share it, so decline a
+                        // dashboard's camera request rather than trigger a
+                        // "camera in use" exception. Audio-only requests still go
+                        // through the normal grant path below.
+                        val requested = request.resources.orEmpty()
+                        val grantableResources = if (presenceOwnsCamera()) {
+                            requested.filterNot { it == PermissionRequest.RESOURCE_VIDEO_CAPTURE }
+                                .toTypedArray()
+                        } else {
+                            requested
+                        }
+                        if (grantableResources.isEmpty()) {
+                            request.deny()
+                            prefs.recordLastLoadStatus(
+                                "Dashboard camera denied: in use by presence wake"
+                            )
+                            return@runOnUiThread
+                        }
+
                         val requiredPermissions =
-                            mapWebResourcesToAndroidPermissions(request.resources)
+                            mapWebResourcesToAndroidPermissions(grantableResources)
                         if (requiredPermissions.isEmpty() || hasAllPermissions(requiredPermissions)) {
-                            request.grant(request.resources)
+                            request.grant(grantableResources)
                             return@runOnUiThread
                         }
 
@@ -619,32 +655,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         return
                     }
                     prefs.recordLastLoadStatus("loading")
-                    publishMqttState()
+                    publishDashboardState()
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
-                    if (!mainFrameLoadState.isVisible || !mainFrameLoadState.isCurrentUrl(url)) return
-                    if (activeEventTakeover == null && !url.isNullOrBlank()) {
-                        loadedDashboardUrl = url
-                        prefs.recordLastUrl(url)
+                    if (mainFrameLoadState.isVisible && mainFrameLoadState.isCurrentUrl(url)) {
+                        if (activeEventTakeover == null && !url.isNullOrBlank()) {
+                            loadedDashboardUrl = url
+                            prefs.recordLastUrl(url)
+                        }
+                        prefs.recordLastLoadStatus("loaded")
+                        publishDashboardState()
+                        return
                     }
-                    prefs.recordLastLoadStatus("loaded")
-                    publishMqttState()
+                    // Safety net: the load finished while we are still LOADING,
+                    // i.e. onPageCommitVisible never arrived (it can be skipped
+                    // while the window surface is not visible, e.g. a reload that
+                    // fires during a screen-off). Treat a finished main frame as
+                    // visible so the overlay clears once the panel wakes.
+                    if (mainFrameLoadState.isLoading && !url.isNullOrBlank()) {
+                        markMainFrameVisible(url, status = "loaded")
+                    }
                 }
 
                 override fun onPageCommitVisible(view: WebView, url: String?) {
-                    if (!mainFrameLoadState.markVisible(url)) return
-                    cancelMainFrameLoadTimeout()
-                    pendingRetry?.let(mainHandler::removeCallbacks)
-                    pendingRetry = null
-                    binding.dashboardFallback.visibility = View.GONE
-                    binding.recoveryOverlay.visibility = View.GONE
-                    if (activeEventTakeover == null && !url.isNullOrBlank()) {
-                        loadedDashboardUrl = url
-                        prefs.recordLastUrl(url)
-                    }
-                    prefs.recordLastLoadStatus("visible")
-                    publishMqttState()
+                    markMainFrameVisible(url, status = "visible")
                 }
 
                 override fun shouldOverrideUrlLoading(
@@ -746,7 +781,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
-    private fun mapWebResourcesToAndroidPermissions(resources: Array<String>): Array<String> {
+    private fun mapWebResourcesToAndroidPermissions(resources: Array<out String>): Array<String> {
         val permissions = linkedSetOf<String>()
         if (resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
             permissions += Manifest.permission.CAMERA
@@ -755,6 +790,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             permissions += Manifest.permission.RECORD_AUDIO
         }
         return permissions.toTypedArray()
+    }
+
+    /**
+     * True when presence wake is holding the camera (service bound it, or it is
+     * enabled and about to). Used to decline a dashboard's camera request so the
+     * two clients never contend for a single-camera device.
+     */
+    private fun presenceOwnsCamera(): Boolean {
+        if (AppVisibility.presenceCameraActive) return true
+        val settings = prefs.load()
+        return settings.ambientModeEnabled && settings.presenceWakeEnabled
     }
 
     private fun isAllowedTopLevelUrl(url: String?): Boolean {
@@ -1045,12 +1091,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         mainHandler.postDelayed(ambientDimRunnable!!, settings.ambientDimAfterSeconds * 1_000L)
     }
 
-    private fun enterAmbientMode(settings: KioskSettings, showScreensaver: Boolean) {
+    private fun enterAmbientMode(
+        settings: KioskSettings,
+        showScreensaver: Boolean,
+        deepSleep: Boolean = settings.deepSleepEnabled
+    ) {
         val transition = ++ambientTransitionGeneration
         binding.ambientScreensaver.animate().cancel()
         applyAmbientBrightness(settings)
-        presenceMotionDetector.reset()
-        lastPresenceAnalysisAtMillis = 0L
         isAmbientDimmed = true
         if (showScreensaver) {
             binding.ambientScreensaver.scene = settings.ambientScene
@@ -1090,11 +1138,82 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             stopAmbientBackground()
             binding.ambientScreensaver.visibility = View.GONE
         }
-        publishMqttState()
+        if (deepSleep) {
+            applyScreenOff(settings)
+        } else {
+            isScreenOff = false
+            WakeSignals.setPowerState(DisplayPowerState.ON)
+        }
+        publishDashboardState()
+    }
+
+    /**
+     * Powers the physical panel off (device owner) or falls back to a hard
+     * brightness-0 "fake off". FLAG_KEEP_SCREEN_ON must be cleared first, else
+     * lockNow() is immediately undone by the still-awake window. Called from
+     * [enterAmbientMode]; the camera keeps running in [PresenceWakeService].
+     */
+    private fun applyScreenOff(settings: KioskSettings) {
+        isScreenOff = true
+        WakeSignals.setPowerState(DisplayPowerState.OFF)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        val admin = ComponentName(this, KioskDeviceAdminReceiver::class.java)
+        if (dpm.isDeviceOwnerApp(packageName)) {
+            // Keep the keyguard disabled so a wake lands straight on the kiosk
+            // rather than an undismissable lock screen.
+            runCatching { dpm.setKeyguardDisabled(admin, true) }
+            runCatching { dpm.lockNow() }
+                .onFailure { prefs.recordLastLoadStatus("Screen off failed: ${it.message}") }
+        } else {
+            // No device-owner privilege: can't power the panel off, so drive
+            // brightness to 0 and keep the window awake (fake off).
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            setWindowBrightness(0f)
+        }
+    }
+
+    /**
+     * Wakes the panel after motion while screen-off. The service has already
+     * fired a wake pulse (PowerManager wake lock) and relaunched us; here we add
+     * the turn-screen-on window flags and leave ambient mode. Safe to call when
+     * not actually off (no-op beyond leaving ambient mode).
+     */
+    private fun wakeScreenFromMotion() {
+        if (!isScreenOff) {
+            resetAmbientTimer()
+            return
+        }
+        Log.i(TAG, "Motion detected; waking screen")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+        if (prefs.load().keepScreenOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        isScreenOff = false
+        WakeSignals.setPowerState(DisplayPowerState.ON)
+        resetAmbientTimer()
     }
 
     private fun leaveAmbientMode() {
         val wasAmbient = isAmbientDimmed
+        if (isScreenOff) {
+            // Restore the awake-window policy a screen-off may have cleared.
+            isScreenOff = false
+            WakeSignals.setPowerState(DisplayPowerState.ON)
+            if (prefs.load().keepScreenOn) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
         screensaverWeatherJob?.cancel()
         screensaverWeatherJob = null
         cancelAmbientBackgroundLoading()
@@ -1130,7 +1249,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             screensaver.releaseCustomMedia()
             setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
         }
-        if (wasAmbient) publishMqttState()
+        if (wasAmbient) publishDashboardState()
     }
 
     private fun startAmbientBackground(settings: KioskSettings) {
@@ -1258,137 +1377,57 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * Starts, reconfigures, or stops [PresenceWakeService] based on settings.
+     * The service runs when presence-wake OR illuminance reporting is enabled;
+     * it owns the camera and both sensors so they survive a true screen-off. The
+     * Activity still owns the CAMERA runtime grant (only needed for presence
+     * wake) because a service cannot request permissions.
+     */
     private fun applyPresenceWakePolicy() {
+        if (AppVisibility.userExited) return
         val settings = prefs.load()
-        sensorManager.unregisterListener(this)
-        proximityWakeGate.reset()
-        if (settings.ambientModeEnabled && settings.presenceWakeEnabled) {
-            sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)?.let { sensor ->
-                sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
-            }
-        }
-
-        val shouldRunCamera = settings.ambientModeEnabled && settings.presenceWakeEnabled
-        if (!shouldRunCamera) {
+        val wantPresence = settings.ambientModeEnabled && settings.presenceWakeEnabled
+        val wantIlluminance = settings.illuminanceReportingEnabled
+        if (!wantPresence && !wantIlluminance) {
             presenceWakePermissionAttempted = false
-            presenceWakeRequested = false
-            stopPresenceWakePipeline()
+            stopPresenceWakeService()
             return
         }
-        presenceWakeRequested = true
 
-        if (!hasAllPermissions(arrayOf(Manifest.permission.CAMERA))) {
-            stopPresenceWakePipeline()
+        // Only presence wake needs the camera; illuminance alone does not.
+        if (wantPresence && !hasAllPermissions(arrayOf(Manifest.permission.CAMERA))) {
             if (!pendingPresenceWakePermissionRequest && !presenceWakePermissionAttempted) {
                 presenceWakePermissionAttempted = true
                 pendingPresenceWakePermissionRequest = true
                 permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
             }
-            return
+            if (!wantIlluminance) {
+                stopPresenceWakeService()
+                return
+            }
+            // Fall through: still run the service for illuminance while the
+            // camera permission prompt is pending.
         }
 
-        presenceWakePermissionAttempted = false
-        startPresenceWakePipeline()
+        if (wantPresence) presenceWakePermissionAttempted = false
+        startPresenceWakeService()
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_PROXIMITY) return
-        val near = event.values.firstOrNull()?.let { it < event.sensor.maximumRange } ?: return
-        if (!proximityWakeGate.update(near)) return
-
-        onPresenceDetected()
+    private fun startPresenceWakeService() {
+        // startForegroundService also re-delivers to a running service, which
+        // triggers its reconfigure path to pick up changed settings. Must be
+        // called from a visible context (onResume) — a cold camera FGS throws on
+        // Android 14+.
+        runCatching { PresenceWakeService.start(this) }
+            .onSuccess { presenceWakeServiceRunning = true }
+            .onFailure { prefs.recordLastLoadStatus("Presence wake service start failed: ${it.message}") }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
-
-    private fun ensurePresenceWakeExecutor(): ExecutorService {
-        val existing = presenceWakeExecutor
-        if (existing != null && !existing.isShutdown) {
-            return existing
-        }
-        return Executors.newSingleThreadExecutor().also { presenceWakeExecutor = it }
-    }
-
-    @SuppressLint("UnsafeOptInUsageError")
-    private fun startPresenceWakePipeline() {
-        if (presenceWakeAnalysis != null || presenceWakeStartPending) {
-            return
-        }
-        presenceWakeStartPending = true
-
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            presenceWakeStartPending = false
-            if (!presenceWakeRequested) {
-                return@addListener
-            }
-            val provider = runCatching { providerFuture.get() }.getOrElse { error ->
-                prefs.recordLastLoadStatus("Presence wake start failed: ${error.message}")
-                return@addListener
-            }
-            if (!prefs.load().presenceWakeEnabled || !prefs.load().ambientModeEnabled) {
-                return@addListener
-            }
-
-            val selector = selectPresenceCamera(provider) ?: run {
-                prefs.recordLastLoadStatus("Presence wake unavailable: no camera found")
-                return@addListener
-            }
-
-            val analysisBuilder = ImageAnalysis.Builder()
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(160, 120),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
-                            )
-                        )
-                        .build()
-                )
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(15, 15)
-            )
-            val analysis = analysisBuilder.build()
-
-            analysis.setAnalyzer(ensurePresenceWakeExecutor()) { imageProxy ->
-                analyzePresenceWakeFrame(imageProxy)
-            }
-
-            runCatching {
-                provider.bindToLifecycle(this, selector, analysis)
-            }.onSuccess {
-                presenceWakeCameraProvider = provider
-                presenceWakeAnalysis = analysis
-                Log.i(TAG, "Motion wake camera started")
-            }.onFailure { error ->
-                analysis.clearAnalyzer()
-                prefs.recordLastLoadStatus("Presence wake start failed: ${error.message}")
-                Log.w(TAG, "Motion wake camera failed", error)
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun stopPresenceWakePipeline() {
-        presenceWakeAnalysis?.clearAnalyzer()
-        presenceWakeAnalysis?.let { analysis ->
-            runCatching { presenceWakeCameraProvider?.unbind(analysis) }
-        }
-        presenceWakeAnalysis = null
-        presenceMotionDetector.reset()
-        lastPresenceAnalysisAtMillis = 0L
-    }
-
-    private fun selectPresenceCamera(provider: ProcessCameraProvider): CameraSelector? {
-        return when {
-            runCatching { provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA) }.getOrDefault(false) ->
-                CameraSelector.DEFAULT_FRONT_CAMERA
-            runCatching { provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) }.getOrDefault(false) ->
-                CameraSelector.DEFAULT_BACK_CAMERA
-            else -> null
-        }
+    private fun stopPresenceWakeService() {
+        if (!presenceWakeServiceRunning) return
+        runCatching { PresenceWakeService.stop(this) }
+        presenceWakeServiceRunning = false
     }
 
     private fun maybePromptStartupCameraPermission() {
@@ -1534,7 +1573,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     val wasAmbient = isAmbientDimmed
                     applyWindowSettings()
                     applySchedulers()
-                    refreshMqttManager()
+                    refreshMqttService()
                     if (section == "dashboard" || section == "browser") loadDashboard()
                     if (wasAmbient && saved.ambientModeEnabled) {
                         ambientDimRunnable?.let(mainHandler::removeCallbacks)
@@ -1626,62 +1665,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         localControlServerPort = -1
     }
 
-    private fun refreshMqttManager() {
+    private fun refreshMqttService() {
         val settings = prefs.load()
-        val storedPassword = prefs.mqttPassword()
         if (!settings.mqttEnabled) {
-            mqttStateJob?.cancel()
-            mqttStateJob = null
-            mqttManager?.stop(removeDiscovery = true)
-            mqttManager = null
-            prefs.recordMqttState("disabled")
+            stopMqttService()
             return
         }
-        if (!MqttContract.isValidBroker(settings.mqttBrokerHost, settings.mqttBrokerPort) ||
-            (storedPassword.isNotEmpty() && settings.mqttUsername.isBlank())
-        ) {
-            mqttStateJob?.cancel()
-            mqttStateJob = null
-            mqttManager?.stop(removeDiscovery = true)
-            mqttManager = null
-            prefs.recordMqttState("configuration error")
-            return
-        }
+        startMqttService()
+        publishDashboardState()
+    }
 
-        mqttManager?.takeIf { it.matches(settings, storedPassword) }?.let { existing ->
-            existing.retryInitialConnection()
-            publishMqttState()
-            return
-        }
+    private fun startMqttService() {
+        runCatching { MqttService.start(this) }
+            .onSuccess { mqttServiceRunning = true }
+            .onFailure { Log.w(TAG, "MQTT service start failed", it) }
+    }
 
-        mqttManager?.stop(removeDiscovery = true)
-        mqttManager = runCatching {
-            MqttManager(
-                deviceKey = prefs.mqttDeviceKey(),
-                settings = settings,
-                password = storedPassword,
-                appVersion = currentVersionName(),
-                onCommand = { command -> mainHandler.post { handleMqttCommand(command) } },
-                onConnectionState = prefs::recordMqttState,
-                onStateRequested = { mainHandler.post { publishMqttState() } }
-            )
-        }.getOrElse {
-            prefs.recordMqttState("configuration error")
-            Log.w(TAG, "MQTT setup failed", it)
-            null
-        }
-        mqttStateJob?.cancel()
-        mqttStateJob = null
-        mqttManager?.let { manager ->
-            manager.start()
-            publishMqttState()
-            mqttStateJob = scope.launch {
-                while (isActive) {
-                    delay(MQTT_STATE_INTERVAL_MS)
-                    publishMqttState()
-                }
-            }
-        }
+    private fun stopMqttService() {
+        if (!mqttServiceRunning) return
+        runCatching { MqttService.stop(this) }
+        mqttServiceRunning = false
     }
 
     internal fun handleMqttCommand(command: WallModeMqttCommand) {
@@ -1706,12 +1709,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val updated = prefs.load().copy(ambientBrightnessPercent = command.percent)
                 prefs.save(updated)
                 if (isAmbientDimmed) applyAmbientBrightness(updated)
-                publishMqttState()
+                publishDashboardState()
             }
             is WallModeMqttCommand.SetAmbientTimeout -> {
                 prefs.save(prefs.load().copy(ambientDimAfterSeconds = command.seconds))
                 resetAmbientTimer()
-                publishMqttState()
+                publishDashboardState()
             }
             is WallModeMqttCommand.SetAmbientScene -> {
                 val updated = prefs.load().copy(ambientScene = command.scene)
@@ -1725,7 +1728,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 ) {
                     startScreensaverWeather(updated.ambientWeatherLocation)
                 }
-                publishMqttState()
+                publishDashboardState()
             }
             is WallModeMqttCommand.OpenProfile -> openDashboardProfile(command.profile)
             is WallModeMqttCommand.SetProfileSchedule -> {
@@ -1737,7 +1740,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     )
                 ) {
                     prefs.recordMqttState("profile schedule rejected: invalid start hours")
-                    publishMqttState()
+                    publishDashboardState()
                     return
                 }
                 prefs.save(settings.copy(scheduleProfilesEnabled = command.enabled))
@@ -1745,7 +1748,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (command.enabled) {
                     if (activeEventTakeover == null) loadDashboard() else pendingScheduledProfile = true
                 } else {
-                    publishMqttState()
+                    publishDashboardState()
                 }
             }
             is WallModeMqttCommand.SetBrowserEngine -> {
@@ -1754,7 +1757,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     prefs.save(current.copy(browserEngine = command.engine))
                     recreateCurrentEngine()
                 } else {
-                    publishMqttState()
+                    publishDashboardState()
                 }
             }
             is WallModeMqttCommand.SetDisplayMode -> {
@@ -1764,54 +1767,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 leaveAmbientMode()
                 val settings = prefs.load()
                 when (command.mode) {
-                    MqttContract.DISPLAY_DIM -> enterAmbientMode(settings, showScreensaver = false)
-                    MqttContract.DISPLAY_SCREENSAVER -> enterAmbientMode(settings, showScreensaver = true)
+                    MqttContract.DISPLAY_DIM ->
+                        enterAmbientMode(settings, showScreensaver = false, deepSleep = false)
+                    MqttContract.DISPLAY_SCREENSAVER ->
+                        enterAmbientMode(settings, showScreensaver = true, deepSleep = false)
+                    MqttContract.DISPLAY_OFF ->
+                        enterAmbientMode(settings, showScreensaver = false, deepSleep = true)
                     else -> resetAmbientTimer()
                 }
-                publishMqttState()
+                publishDashboardState()
             }
         }
     }
 
-    private fun publishMqttState() {
-        val manager = mqttManager ?: return
+    private fun publishDashboardState() {
         val settings = prefs.load()
-        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-        val batteryPercent = if (level >= 0 && scale > 0) {
-            (level * 100 / scale).coerceIn(0, 100)
-        } else {
-            0
-        }
-        val batteryStatus = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val charging = batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING ||
-            batteryStatus == BatteryManager.BATTERY_STATUS_FULL
-        val networkConnected = connectivityManager.activeNetwork?.let { network ->
-            connectivityManager.getNetworkCapabilities(network)
-                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        } == true
-        val screenOn = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
         val displayMode = currentDisplayMode()
         val takeover = activeEventTakeover
         val dashboardProblem = mainFrameLoadState.hasProblem ||
             binding.recoveryOverlay.visibility == View.VISIBLE
-        val health = when {
-            !networkConnected -> "offline"
-            dashboardProblem -> "recovering"
-            else -> "ok"
-        }
-        manager.publishState(
-            WallModeMqttState(
-                batteryPercent = batteryPercent,
-                charging = charging,
-                screenOn = screenOn,
+        MqttBridge.publishDashboardState(
+            DashboardState(
+                currentPage = binding.webView.url ?: loadedDashboardUrl,
+                displayMode = displayMode,
                 screensaverActive = displayMode == MqttContract.DISPLAY_SCREENSAVER,
                 dashboardProblem = dashboardProblem,
-                currentPage = binding.webView.url ?: loadedDashboardUrl,
-                health = health,
-                webViewVersion = WebView.getCurrentWebViewPackage()?.versionName ?: "unknown",
-                appVersion = currentVersionName(),
                 ambientBrightness = settings.ambientBrightnessPercent,
                 ambientTimeout = settings.ambientDimAfterSeconds,
                 ambientScene = MqttContract.ambientSceneName(settings.ambientScene),
@@ -1822,8 +1802,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 } else {
                     MqttContract.ENGINE_CHROMIUM
                 },
-                displayMode = displayMode,
-                networkConnected = networkConnected,
                 takeoverActive = takeover != null,
                 takeoverId = takeover?.id.orEmpty(),
                 takeoverPriority = takeover?.priority ?: 0
@@ -1831,13 +1809,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 
-    private fun currentDisplayMode(): String {
-        return when {
-            !isAmbientDimmed -> MqttContract.DISPLAY_DASHBOARD
-            binding.ambientScreensaver.visibility == View.VISIBLE -> MqttContract.DISPLAY_SCREENSAVER
-            else -> MqttContract.DISPLAY_DIM
-        }
-    }
+    private fun currentDisplayMode(): String =
+        DisplayModeResolver.displayMode(
+            isAmbientDimmed = isAmbientDimmed,
+            isScreenOff = isScreenOff,
+            screensaverVisible = binding.ambientScreensaver.visibility == View.VISIBLE
+        )
 
     private fun reloadCurrentTarget() {
         val takeover = activeEventTakeover
@@ -1883,7 +1860,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         hideActionCardUi()
         loadWebUrl(command.url, prefs.load(), rememberAsDashboard = false)
         scheduleEventTakeoverTimeout(activeEventTakeover!!)
-        publishMqttState()
+        publishDashboardState()
     }
 
     private fun showActionCard(command: WallModeMqttCommand.ShowActionCard) {
@@ -1911,7 +1888,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         leaveAmbientMode()
         showActionCardUi(command)
         scheduleEventTakeoverTimeout(activeEventTakeover!!)
-        publishMqttState()
+        publishDashboardState()
     }
 
     private fun showActionCardUi(card: WallModeMqttCommand.ShowActionCard) {
@@ -1947,7 +1924,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         buttons: List<MaterialButton>
     ) {
         buttons.forEach { it.isEnabled = false }
-        if (mqttManager?.publishActionResponse(cardId, actionId) == true) {
+        if (MqttBridge.publishActionResponse(cardId, actionId)) {
             dismissEventTakeover(cardId)
         } else {
             binding.actionCardError.visibility = View.VISIBLE
@@ -2025,12 +2002,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         if (restoreDisplayMode) {
             when (takeover.returnDisplayMode) {
-                MqttContract.DISPLAY_DIM -> enterAmbientMode(prefs.load(), showScreensaver = false)
-                MqttContract.DISPLAY_SCREENSAVER -> enterAmbientMode(prefs.load(), showScreensaver = true)
+                MqttContract.DISPLAY_DIM ->
+                    enterAmbientMode(prefs.load(), showScreensaver = false, deepSleep = false)
+                MqttContract.DISPLAY_SCREENSAVER ->
+                    enterAmbientMode(prefs.load(), showScreensaver = true, deepSleep = false)
+                MqttContract.DISPLAY_OFF ->
+                    enterAmbientMode(prefs.load(), showScreensaver = false, deepSleep = true)
                 else -> resetAmbientTimer()
             }
         }
-        publishMqttState()
+        publishDashboardState()
     }
 
     private fun cancelEventTakeover(): Boolean {
@@ -2058,54 +2039,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }.toString()
     }
 
-    private fun analyzePresenceWakeFrame(imageProxy: ImageProxy) {
-        val settings = prefs.load()
-        if (!settings.presenceWakeEnabled || !settings.ambientModeEnabled) {
-            imageProxy.close()
-            return
-        }
-
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastPresenceAnalysisAtMillis < PRESENCE_ANALYSIS_INTERVAL_MS) {
-            imageProxy.close()
-            return
-        }
-        lastPresenceAnalysisAtMillis = now
-
-        val luminance = imageProxy.planes.firstOrNull()
-        if (luminance == null) {
-            imageProxy.close()
-            return
-        }
-
-        val motionDetected = presenceMotionDetector.detect(
-            luminance.buffer,
-            imageProxy.width,
-            imageProxy.height,
-            luminance.rowStride,
-            luminance.pixelStride
-        )
-        imageProxy.close()
-        if (motionDetected) {
-            onPresenceDetected()
-        }
-    }
-
+    /**
+     * UI reaction to a motion detection. Invoked on the main thread from the
+     * [WakeSignals] collector (fed by [PresenceWakeService]) and directly from
+     * instrumentation tests. When the panel is off it is woken via
+     * [wakeScreenFromMotion]; otherwise this just undims / resets the idle timer.
+     * The hardware wake pulse, the screen-off cooldown, and the MQTT motion
+     * publish (with its own cooldown) live in the service.
+     */
     internal fun onPresenceDetected() {
         mainHandler.post {
-            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@post
             val settings = prefs.load()
             if (!settings.presenceWakeEnabled || !settings.ambientModeEnabled) return@post
-            mqttManager?.publishMotion()
-
-            // Cooldown limits waking, never activity that postpones the idle deadline.
+            if (isScreenOff) {
+                wakeScreenFromMotion()
+                return@post
+            }
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@post
             if (isAmbientDimmed) {
-                val now = SystemClock.elapsedRealtime()
-                val lastWake = lastPresenceWakeAtMillis
-                if (lastWake != null && now - lastWake < settings.presenceWakeCooldownSeconds * 1_000L) {
-                    return@post
-                }
-                lastPresenceWakeAtMillis = now
                 Log.i(TAG, "Motion detected; leaving ambient mode")
             }
             resetAmbientTimer()
@@ -2279,6 +2230,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Log.w(TAG, "Scheduled reload in ${settings.reloadIntervalSeconds}s. Reason: $reason")
     }
 
+    /**
+     * Shared "main frame became visible" path used by onPageCommitVisible and
+     * the onPageFinished safety net. Marks the load state visible (adopting any
+     * redirect target), cancels the timeout/retry, hides the loading and recovery
+     * overlays, and records the final URL. No-op when not currently LOADING.
+     */
+    private fun markMainFrameVisible(url: String?, status: String) {
+        if (!mainFrameLoadState.markVisible(url)) return
+        cancelMainFrameLoadTimeout()
+        pendingRetry?.let(mainHandler::removeCallbacks)
+        pendingRetry = null
+        binding.dashboardFallback.visibility = View.GONE
+        binding.recoveryOverlay.visibility = View.GONE
+        if (activeEventTakeover == null && !url.isNullOrBlank()) {
+            loadedDashboardUrl = url
+            prefs.recordLastUrl(url)
+        }
+        prefs.recordLastLoadStatus(status)
+        publishDashboardState()
+    }
+
     private fun beginMainFrameLoad(url: String?) {
         val attempt = mainFrameLoadState.begin(url)
         cancelMainFrameLoadTimeout()
@@ -2312,7 +2284,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         binding.dashboardFallback.visibility = View.VISIBLE
         prefs.recordLastLoadStatus(reason)
         scheduleRetry(reason)
-        publishMqttState()
+        publishDashboardState()
     }
 
     private fun cancelMainFrameLoadTimeout() {
@@ -2327,6 +2299,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun exitKioskNow() {
+        AppVisibility.userExited = true
+        stopPresenceWakeService()
+        stopMqttService()
         attemptStopLockTaskIfRunning()
         finishAndRemoveTask()
     }
@@ -2378,6 +2353,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     companion object {
+        const val EXTRA_WAKE_FROM_MOTION = "io.github.rvbcrs.wallmode.extra.WAKE_FROM_MOTION"
         private const val TAG = "WallModeMain"
         private const val ADMIN_GESTURE_TAP_COUNT = 5
         private const val ADMIN_GESTURE_WINDOW_MS = 2_500L
@@ -2385,9 +2361,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val IMMICH_THUMBNAIL_RETRY_DELAY_MS = 5_000L
         private const val QUICK_RELOAD_DELAY_MS = 1_200L
         private const val SCREENSAVER_WEATHER_REFRESH_MS = 30 * 60_000L
-        private const val MQTT_STATE_INTERVAL_MS = 60_000L
         private const val MAIN_FRAME_LOAD_TIMEOUT_MS = 30_000L
-        private const val PRESENCE_ANALYSIS_INTERVAL_MS = 250L
         private const val PREVIEW_MAX_DIMENSION_PX = 720
         private const val PREVIEW_CAPTURE_TIMEOUT_SECONDS = 3L
         private const val PREVIEW_JPEG_QUALITY = 65
@@ -2542,7 +2516,13 @@ internal class MainFrameLoadState {
     }
 
     fun markVisible(url: String? = currentUrl): Boolean {
-        if (phase != Phase.LOADING || !isCurrentUrl(url)) return false
+        // A main-frame commit-visible (or finished) during our active load is
+        // authoritative, even when the server redirected to a different URL than
+        // we requested (http->https, trailing slash, /lovelace -> /lovelace/0,
+        // auth round-trips). Adopt the final URL rather than rejecting the match,
+        // so the loading overlay reliably clears once the page actually renders.
+        if (phase != Phase.LOADING) return false
+        if (!url.isNullOrBlank()) currentUrl = url
         phase = Phase.VISIBLE
         return true
     }

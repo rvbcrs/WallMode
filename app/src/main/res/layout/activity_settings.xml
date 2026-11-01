@@ -1293,6 +1293,80 @@
                                         android:inputType="number"
                                         android:maxLines="1" />
                                 </com.google.android.material.textfield.TextInputLayout>
+
+                                <com.google.android.material.switchmaterial.SwitchMaterial
+                                    android:id="@+id/switch_deep_sleep"
+                                    style="@style/Widget.WallMode.SettingSwitch"
+                                    android:layout_marginTop="10dp"
+                                    android:text="@string/deep_sleep_enabled" />
+
+                                <TextView
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="2dp"
+                                    android:text="@string/deep_sleep_notice"
+                                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                                    android:textColor="@color/settings_text_secondary" />
+
+                                <com.google.android.material.switchmaterial.SwitchMaterial
+                                    android:id="@+id/switch_respect_manual_screen_off"
+                                    style="@style/Widget.WallMode.SettingSwitch"
+                                    android:layout_marginTop="10dp"
+                                    android:text="@string/respect_manual_screen_off_enabled" />
+
+                                <TextView
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="2dp"
+                                    android:text="@string/respect_manual_screen_off_notice"
+                                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                                    android:textColor="@color/settings_text_secondary" />
+
+                                <com.google.android.material.switchmaterial.SwitchMaterial
+                                    android:id="@+id/switch_illuminance_reporting"
+                                    style="@style/Widget.WallMode.SettingSwitch"
+                                    android:layout_marginTop="14dp"
+                                    android:text="@string/illuminance_reporting_enabled" />
+
+                                <TextView
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="2dp"
+                                    android:text="@string/illuminance_reporting_notice"
+                                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                                    android:textColor="@color/settings_text_secondary" />
+
+                                <com.google.android.material.textfield.TextInputLayout
+                                    style="@style/Widget.WallMode.SettingsTextInput"
+                                    android:layout_width="260dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_gravity="end"
+                                    android:layout_marginTop="10dp"
+                                    android:hint="@string/illuminance_min_delta_lux">
+
+                                    <com.google.android.material.textfield.TextInputEditText
+                                        android:id="@+id/input_illuminance_min_delta"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:inputType="number"
+                                        android:maxLines="1" />
+                                </com.google.android.material.textfield.TextInputLayout>
+
+                                <com.google.android.material.textfield.TextInputLayout
+                                    style="@style/Widget.WallMode.SettingsTextInput"
+                                    android:layout_width="260dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_gravity="end"
+                                    android:layout_marginTop="10dp"
+                                    android:hint="@string/illuminance_debounce_seconds">
+
+                                    <com.google.android.material.textfield.TextInputEditText
+                                        android:id="@+id/input_illuminance_debounce"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:inputType="number"
+                                        android:maxLines="1" />
+                                </com.google.android.material.textfield.TextInputLayout>
                             </LinearLayout>
                         </com.google.android.material.card.MaterialCardView>
                     </LinearLayout>
@@ -1494,6 +1568,28 @@
                                         android:id="@+id/switch_lock_task_mode"
                                         style="@style/Widget.WallMode.SettingSwitch"
                                         android:text="@string/lock_task_mode" />
+
+                                    <TextView
+                                        android:id="@+id/device_owner_status"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:layout_marginTop="10dp"
+                                        android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                                        android:textColor="@color/settings_text_secondary" />
+
+                                    <com.google.android.material.button.MaterialButton
+                                        android:id="@+id/btn_release_device_owner"
+                                        style="@style/Widget.WallMode.Button.Danger"
+                                        android:layout_width="wrap_content"
+                                        android:layout_height="wrap_content"
+                                        android:layout_marginTop="10dp"
+                                        android:text="@string/release_device_owner" />
+                                    <com.google.android.material.button.MaterialButton
+                                        android:id="@+id/btnRequestDeviceOwner"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:text="Request Device Owner"
+                                        app:icon="@drawable/ic_admin_panel_settings" />
                                 </LinearLayout>
                             </com.google.android.material.card.MaterialCardView>
 

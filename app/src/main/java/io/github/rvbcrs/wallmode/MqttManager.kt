@@ -29,6 +29,22 @@ internal data class ActionCardAction(
     val label: String
 )
 
+internal data class DashboardState(
+    val currentPage: String,
+    val displayMode: String,
+    val screensaverActive: Boolean,
+    val dashboardProblem: Boolean,
+    val ambientBrightness: Int,
+    val ambientTimeout: Int,
+    val ambientScene: String,
+    val activeProfile: String,
+    val profileScheduleEnabled: Boolean,
+    val browserEngine: String,
+    val takeoverActive: Boolean,
+    val takeoverId: String,
+    val takeoverPriority: Int
+)
+
 internal data class WallModeMqttState(
     val batteryPercent: Int,
     val charging: Boolean,
@@ -49,7 +65,8 @@ internal data class WallModeMqttState(
     val networkConnected: Boolean,
     val takeoverActive: Boolean,
     val takeoverId: String,
-    val takeoverPriority: Int
+    val takeoverPriority: Int,
+    val illuminanceLux: Float?
 )
 
 internal sealed interface WallModeMqttCommand {
@@ -92,6 +109,7 @@ internal object MqttContract {
     const val DISPLAY_DASHBOARD = "Dashboard"
     const val DISPLAY_DIM = "Dim"
     const val DISPLAY_SCREENSAVER = "Clock + weather"
+    const val DISPLAY_OFF = "Off"
     const val ENGINE_WEBVIEW = "Android WebView"
     const val ENGINE_CHROMIUM = "Chromium-like"
     const val SCENE_AURORA_WEATHER = "Aurora weather"
@@ -202,7 +220,10 @@ internal object MqttContract {
                 else -> null
             }
             "display_mode" -> payload
-                .takeIf { it == DISPLAY_DASHBOARD || it == DISPLAY_DIM || it == DISPLAY_SCREENSAVER }
+                .takeIf {
+                    it == DISPLAY_DASHBOARD || it == DISPLAY_DIM ||
+                        it == DISPLAY_SCREENSAVER || it == DISPLAY_OFF
+                }
                 ?.let(WallModeMqttCommand::SetDisplayMode)
             else -> null
         }
@@ -432,6 +453,8 @@ internal class MqttManager(
 
     @Volatile
     private var lastState: WallModeMqttState? = null
+    // Last state JSON actually published, for whole-payload dedup.
+    private var lastStatePayload: String? = null
 
     init {
         client.setCallback(object : MqttCallbackExtended {
@@ -446,7 +469,7 @@ internal class MqttManager(
                 subscribe()
                 publish(discoveryTopic, discoveryPayload, retained = true)
                 publish(availabilityTopic, "online", retained = true)
-                lastState?.let(::publishStateNow)
+                lastState?.let { publishStateInternal(it, force = true) }
                 onConnectionState("connected")
                 onStateRequested()
             }
@@ -508,8 +531,7 @@ internal class MqttManager(
     }
 
     fun publishState(state: WallModeMqttState) {
-        lastState = state
-        publishStateNow(state)
+        publishStateInternal(state, force = false)
     }
 
     fun publishMotion() {
@@ -609,8 +631,13 @@ internal class MqttManager(
         }.onFailure { Log.w(TAG, "MQTT subscribe failed", it) }
     }
 
-    private fun publishStateNow(state: WallModeMqttState) {
-        val payload = JSONObject().apply {
+    /**
+     * Serializes a state snapshot to the single retained JSON state payload.
+     * Illuminance is omitted when null so HA shows "unavailable" rather than a
+     * stale zero.
+     */
+    private fun stateJson(state: WallModeMqttState): String {
+        return JSONObject().apply {
             put("battery", state.batteryPercent)
             put("charging", state.charging)
             put("screen_on", state.screenOn)
@@ -631,8 +658,27 @@ internal class MqttManager(
             put("takeover_active", state.takeoverActive)
             put("takeover_id", state.takeoverId)
             put("takeover_priority", state.takeoverPriority)
+            state.illuminanceLux?.let { put("illuminance", (it * 10).toInt() / 10.0) }
         }.toString()
-        publish(stateTopic, payload, retained = true)
+    }
+
+    /**
+     * Publishes the full retained state JSON, but only when it differs from the
+     * last payload published (dedup) — so an unchanged periodic tick or a
+     * no-op dashboard-state update does not republish. [force] always publishes,
+     * used on (re)connect to refresh the retained topic after a broker restart.
+     *
+     * Illuminance throttling happens upstream: [IlluminanceReportGate] only emits
+     * a publish request after its delta/debounce gate passes, so lux jitter does
+     * not drive this, while discrete flag changes publish as soon as they occur.
+     */
+    private fun publishStateInternal(state: WallModeMqttState, force: Boolean) {
+        val payload = stateJson(state)
+        lastState = state
+        if (!force && payload == lastStatePayload) return
+        if (publish(stateTopic, payload, retained = true)) {
+            lastStatePayload = payload
+        }
     }
 
     private fun publish(topic: String, payload: String, retained: Boolean): Boolean {
@@ -677,6 +723,13 @@ internal class MqttManager(
             put("unit_of_measurement", "%")
             put("state_class", "measurement")
         })
+        components.put("illuminance", stateComponent("illuminance", "sensor", "Illuminance", "illuminance").apply {
+            put("device_class", "illuminance")
+            put("unit_of_measurement", "lx")
+            put("state_class", "measurement")
+            // Absent key → empty state → HA shows "unavailable" rather than 0.
+            put("value_template", "{{ value_json.illuminance | default('', true) }}")
+        })
         components.put("charging", component("charging", "binary_sensor", "Charging").apply {
             put("device_class", "battery_charging")
             put("entity_category", "diagnostic")
@@ -715,7 +768,10 @@ internal class MqttManager(
         components.put("motion", component("motion", "binary_sensor", "Motion").apply {
             put("device_class", "motion")
             put("state_topic", motionTopic)
-            put("off_delay", 5)
+            // Longer than the service-side motion publish cooldown so sustained
+            // presence (republished each cooldown window) keeps the HA sensor
+            // solidly ON instead of flapping OFF between throttled republishes.
+            put("off_delay", 35)
         })
         components.put("current_page", stateComponent("current_page", "sensor", "Current page", "current_page").apply {
             put("icon", "mdi:web")
@@ -815,7 +871,8 @@ internal class MqttManager(
             put("options", JSONArray(listOf(
                 MqttContract.DISPLAY_DASHBOARD,
                 MqttContract.DISPLAY_DIM,
-                MqttContract.DISPLAY_SCREENSAVER
+                MqttContract.DISPLAY_SCREENSAVER,
+                MqttContract.DISPLAY_OFF
             )))
             put("command_topic", "${commandPrefix}display_mode")
         })

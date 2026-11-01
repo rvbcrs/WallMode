@@ -16,11 +16,8 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.camera.core.ImageAnalysis
 import androidx.lifecycle.Lifecycle
 import java.io.File
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.TimeUnit
 
 /** Opt-in emulator check: real camera startup, then deterministic injected presence events. */
 internal object PresenceInstrumentationChecks {
@@ -117,7 +114,7 @@ internal object PresenceInstrumentationChecks {
                     check(denyButton() == null) { "Camera permission was requested again after denial" }
                     onMain {
                         check(main.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
-                        check(field("presenceWakePermissionAttempted") == true && field("presenceWakeAnalysis") == null)
+                        check(field("presenceWakePermissionAttempted") == true && field("presenceWakeServiceRunning") == false)
                         check(prefs.load().presenceWakeEnabled) { "Camera denial disabled proximity presence" }
                     }
                 }
@@ -135,24 +132,14 @@ internal object PresenceInstrumentationChecks {
                 return
             }
 
-            val cameraDeadline = SystemClock.elapsedRealtime() + 10_000
-            var analyzedAt = 0L
-            while (analyzedAt == 0L && SystemClock.elapsedRealtime() < cameraDeadline) {
-                onMain {
-                    check(!ambient()) { "Camera startup reached ambient before any awake analysis" }
-                    if (field("presenceWakeAnalysis") != null) {
-                        analyzedAt = field("lastPresenceAnalysisAtMillis") as Long
-                    }
-                }
-                if (analyzedAt == 0L) SystemClock.sleep(250)
+            val serviceDeadline = SystemClock.elapsedRealtime() + 10_000
+            while (field("presenceWakeServiceRunning") != true && SystemClock.elapsedRealtime() < serviceDeadline) {
+                SystemClock.sleep(250)
             }
-            check(analyzedAt > 0) { "Camera must analyze frames while awake" }
-            SystemClock.sleep(750)
             onMain {
-                check(!ambient() && (field("lastPresenceAnalysisAtMillis") as Long) > analyzedAt)
-                (field("presenceWakeAnalysis") as ImageAnalysis).clearAnalyzer()
+                check(field("presenceWakeServiceRunning") == true) { "Activity did not start the presence wake service" }
+                check(!ambient()) { "Service startup reached ambient before any awake motion" }
             }
-            (field("presenceWakeExecutor") as ExecutorService).submit {}.get(10, TimeUnit.SECONDS)
             motion()
             val originalTimer = field("ambientDimRunnable")
             SystemClock.sleep(10_000)
@@ -184,8 +171,8 @@ internal object PresenceInstrumentationChecks {
             motion()
             onMain {
                 check(!main.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
-                check(field("presenceWakeAnalysis") == null && field("ambientDimRunnable") === pausedTimer) {
-                    "Paused activity retained camera or accepted motion"
+                check(field("ambientDimRunnable") === pausedTimer) {
+                    "Stopped activity accepted motion and reset the idle timer"
                 }
             }
         } finally {
