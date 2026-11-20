@@ -109,8 +109,16 @@ internal object LocalControlSettings {
             Group("Presence wake", listOf(
                 toggle(KioskSettings::presenceWakeEnabled, "Wake on motion") { s, v -> s.copy(presenceWakeEnabled = v) },
                 number(KioskSettings::presenceWakeCooldownSeconds, "Presence wake cooldown (seconds)",
-                    KioskPreferences.MIN_PRESENCE_WAKE_COOLDOWN_SECONDS..KioskPreferences.MAX_PRESENCE_WAKE_COOLDOWN_SECONDS) { s, v -> s.copy(presenceWakeCooldownSeconds = v) }
-            ), "Uses proximity and the front camera to return to the dashboard. Camera permission must be granted on the tablet.")
+                    KioskPreferences.MIN_PRESENCE_WAKE_COOLDOWN_SECONDS..KioskPreferences.MAX_PRESENCE_WAKE_COOLDOWN_SECONDS) { s, v -> s.copy(presenceWakeCooldownSeconds = v) },
+                toggle(KioskSettings::deepSleepEnabled, "Turn screen off (deep sleep)") { s, v -> s.copy(deepSleepEnabled = v) }
+            ), "Uses proximity and the front camera to return to the dashboard. Camera permission must be granted on the tablet. Deep sleep powers the panel off (device-owner provisioning) instead of dimming."),
+            Group("Ambient light sensor", listOf(
+                toggle(KioskSettings::illuminanceReportingEnabled, "Report illuminance to MQTT") { s, v -> s.copy(illuminanceReportingEnabled = v) },
+                number(KioskSettings::illuminanceMinDeltaLux, "Minimum change to report (lux)",
+                    KioskPreferences.MIN_ILLUMINANCE_MIN_DELTA_LUX..KioskPreferences.MAX_ILLUMINANCE_MIN_DELTA_LUX) { s, v -> s.copy(illuminanceMinDeltaLux = v) },
+                number(KioskSettings::illuminanceDebounceSeconds, "Debounce between reports (seconds)",
+                    KioskPreferences.MIN_ILLUMINANCE_DEBOUNCE_SECONDS..KioskPreferences.MAX_ILLUMINANCE_DEBOUNCE_SECONDS) { s, v -> s.copy(illuminanceDebounceSeconds = v) }
+            ), "Publishes the device's built-in light sensor (lux) to Home Assistant over MQTT. Reports only when the reading changes by at least the minimum and the debounce has elapsed.")
         ),
         "browser" to listOf(
             Group("Browser profile", listOf(

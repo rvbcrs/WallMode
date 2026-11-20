@@ -41,6 +41,14 @@
     <string name="engine_chromium_short">Chromium-like</string>
     <string name="browser_engine_notice">WebView-only runtime; Chromium-like changes the browser profile without adding another engine.</string>
     <string name="lock_task_mode">Enable lock task kiosk mode (device owner)</string>
+    <string name="release_device_owner">Release device owner</string>
+    <string name="device_owner_status_active">Device owner: active — deep sleep can fully power the screen off.</string>
+    <string name="device_owner_status_inactive">Device owner: not active — deep sleep falls back to a black screen (panel stays powered). Provision as device owner to enable true power-off.</string>
+    <string name="release_device_owner_confirm_title">Release device owner?</string>
+    <string name="release_device_owner_confirm_message">WallMode will give up device-owner privileges. Kiosk lock-task and true screen-off will stop working until the device is re-provisioned. This cannot be undone from the app.</string>
+    <string name="release_device_owner_done">Device owner released.</string>
+    <string name="release_device_owner_failed">Could not release device owner: %1$s</string>
+    <string name="release_device_owner_not_owner">The app is not currently device owner.</string>
 
     <string name="admin_password">Admin password</string>
     <string name="confirm_admin_password">Confirm admin password</string>
@@ -192,6 +200,14 @@
     <string name="presence_wake_cooldown_seconds">Presence wake cooldown (seconds)</string>
     <string name="presence_wake_notice">Detected movement restarts the idle timer and returns to the dashboard from dim or screensaver mode.</string>
     <string name="presence_wake_battery_notice">While enabled, the camera stays active on the dashboard too. Frames are processed locally and are not recorded.</string>
+    <string name="deep_sleep_enabled">Turn screen off (deep sleep)</string>
+    <string name="deep_sleep_notice">Powers the panel fully off instead of dimming. Requires device-owner provisioning; otherwise the screen is driven to full black. Motion turns it back on.</string>
+    <string name="respect_manual_screen_off_enabled">Keep screen off when turned off manually</string>
+    <string name="respect_manual_screen_off_notice">When you turn the screen off with the power button, motion will not wake it until you turn it back on manually. Turn this off to let motion always re-wake the panel.</string>
+    <string name="illuminance_reporting_enabled">Report illuminance to Home Assistant (MQTT)</string>
+    <string name="illuminance_reporting_notice">Publishes the built-in light sensor (lux) over MQTT, including while the screen is off. Reports only on significant change.</string>
+    <string name="illuminance_min_delta_lux">Minimum change to report (lux)</string>
+    <string name="illuminance_debounce_seconds">Debounce between reports (seconds)</string>
 
     <string name="updates_enabled">Enable update checks</string>
     <string name="github_repo_slug">GitHub repo (owner/repo)</string>
@@ -316,4 +332,10 @@
     <string name="card_config_title">Tools and configuration</string>
     <string name="card_danger">Danger zone</string>
     <string name="card_danger_title">Reset WallMode settings</string>
+    <string name="presence_wake_channel_name">Motion wake</string>
+    <string name="presence_wake_channel_description">Keeps the camera running so motion can wake the screen.</string>
+    <string name="presence_wake_notification_text">Watching for motion to wake the screen</string>
+    <string name="mqtt_channel_name">Home Assistant link</string>
+    <string name="mqtt_channel_description">Keeps the MQTT connection to Home Assistant alive while the screen is off.</string>
+    <string name="mqtt_notification_text">Connected to Home Assistant</string>
 </resources>

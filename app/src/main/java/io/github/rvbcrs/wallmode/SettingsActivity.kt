@@ -3,10 +3,12 @@ package io.github.rvbcrs.wallmode
 import android.app.DownloadManager
 import android.app.Dialog
 import android.app.ActivityManager
+import android.app.admin.DevicePolicyManager
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -104,6 +106,16 @@ class SettingsActivity : AppCompatActivity() {
         } else {
             markSaved()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppVisibility.settingsOpen = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        AppVisibility.settingsOpen = false
     }
 
     override fun onDestroy() {
@@ -229,6 +241,113 @@ class SettingsActivity : AppCompatActivity() {
         binding.btnExitKiosk.setOnClickListener {
             maybeExitKiosk()
         }
+        binding.btnRequestDeviceOwner.setOnClickListener {
+            requestDeviceOwner()
+        }
+        binding.btnReleaseDeviceOwner.setOnClickListener {
+            confirmReleaseDeviceOwner()
+        }
+    }
+
+    private fun confirmReleaseDeviceOwner() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        if (!dpm.isDeviceOwnerApp(packageName)) {
+            Toast.makeText(this, R.string.release_device_owner_not_owner, Toast.LENGTH_SHORT).show()
+            refreshDeviceOwnerStatus()
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.release_device_owner_confirm_title)
+            .setMessage(R.string.release_device_owner_confirm_message)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.release_device_owner) { _, _ -> releaseDeviceOwner(dpm) }
+            .show()
+    }
+
+    private fun releaseDeviceOwner(dpm: DevicePolicyManager) {
+        // Clearing the keyguard/lock-task policies first avoids leaving a
+        // half-applied device-owner state behind.
+        val admin = ComponentName(this, KioskDeviceAdminReceiver::class.java)
+        runCatching { if (isLockTaskRunning()) stopLockTask() }
+        runCatching { dpm.setLockTaskPackages(admin, emptyArray()) }
+        runCatching { dpm.setKeyguardDisabled(admin, false) }
+        val result = runCatching { dpm.clearDeviceOwnerApp(packageName) }
+        if (result.isSuccess) {
+            Toast.makeText(this, R.string.release_device_owner_done, Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(
+                this,
+                getString(R.string.release_device_owner_failed, result.exceptionOrNull()?.message ?: "unknown"),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        refreshDeviceOwnerStatus()
+    }
+    private fun requestDeviceOwner() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+
+        if (dpm.isDeviceOwnerApp(packageName)) {
+            Toast.makeText(
+                this,
+                "App is already Device Owner",
+                Toast.LENGTH_SHORT
+            ).show()
+            refreshDeviceOwnerStatus()
+            return
+        }
+
+        val component = "$packageName/.KioskDeviceAdminReceiver"
+        val command = "adb shell dpm set-device-owner --user 0 $component"
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Request Device Owner")
+            .setMessage(
+                "Device Owner cannot be enabled directly by the app.\n\n" +
+                        "Connect your device to a computer with ADB enabled " +
+                        "and execute the following command:\n\n$command\n\n" +
+                        "This generally requires a freshly reset device " +
+                        "that has not completed device provisioning."
+            )
+            .setNegativeButton(android.R.string.cancel, null)
+            .setNeutralButton("Copy command") { _, _ ->
+                getSystemService(ClipboardManager::class.java)
+                    .setPrimaryClip(
+                        ClipData.newPlainText("ADB command", command)
+                    )
+
+                Toast.makeText(
+                    this,
+                    "ADB command copied",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
+    private fun isLockTaskRunning(): Boolean =
+        getSystemService(ActivityManager::class.java).lockTaskModeState !=
+            ActivityManager.LOCK_TASK_MODE_NONE
+
+    private fun refreshDeviceOwnerStatus() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE)
+                as DevicePolicyManager
+
+        val isOwner = dpm.isDeviceOwnerApp(packageName)
+
+        binding.deviceOwnerStatus.setText(
+            if (isOwner) {
+                R.string.device_owner_status_active
+            } else {
+                R.string.device_owner_status_inactive
+            }
+        )
+
+        binding.btnRequestDeviceOwner.visibility =
+            if (isOwner) View.GONE else View.VISIBLE
+
+        binding.btnReleaseDeviceOwner.visibility =
+            if (isOwner) View.VISIBLE else View.GONE
     }
 
     internal fun showSupportLink(providerName: Int, url: String): AlertDialog {
@@ -303,6 +422,9 @@ class SettingsActivity : AppCompatActivity() {
             binding.switchMaintenanceEnabled,
             binding.switchAmbientFollowSystemBrightness,
             binding.switchPresenceWake,
+            binding.switchDeepSleep,
+            binding.switchRespectManualScreenOff,
+            binding.switchIlluminanceReporting,
             binding.switchLocalControlPreview,
             binding.switchMqttTls
         ).forEach { control ->
@@ -342,6 +464,8 @@ class SettingsActivity : AppCompatActivity() {
             binding.inputAmbientDimAfter,
             binding.inputAmbientBrightness,
             binding.inputPresenceWakeCooldown,
+            binding.inputIlluminanceMinDelta,
+            binding.inputIlluminanceDebounce,
             binding.inputLocalControlPort,
             binding.inputMqttBrokerHost,
             binding.inputMqttBrokerPort,
@@ -617,6 +741,7 @@ class SettingsActivity : AppCompatActivity() {
         binding.switchAutoStartBoot.isChecked = settings.autoStartOnBoot
         binding.switchFullscreen.isChecked = settings.fullscreen
         binding.switchLockTaskMode.isChecked = settings.lockTaskMode
+        refreshDeviceOwnerStatus()
         binding.switchAutoReloadOnFailure.isChecked = settings.autoReloadOnFailure
         binding.switchAutoDiscoverHomeAssistant.isChecked = settings.autoDiscoverHomeAssistant
 
@@ -668,6 +793,11 @@ class SettingsActivity : AppCompatActivity() {
             settings.ambientFollowSystemBrightness
         binding.switchPresenceWake.isChecked = settings.presenceWakeEnabled
         binding.inputPresenceWakeCooldown.setText(settings.presenceWakeCooldownSeconds.toString())
+        binding.switchDeepSleep.isChecked = settings.deepSleepEnabled
+        binding.switchRespectManualScreenOff.isChecked = settings.respectManualScreenOff
+        binding.switchIlluminanceReporting.isChecked = settings.illuminanceReportingEnabled
+        binding.inputIlluminanceMinDelta.setText(settings.illuminanceMinDeltaLux.toString())
+        binding.inputIlluminanceDebounce.setText(settings.illuminanceDebounceSeconds.toString())
         binding.switchLocalControlEnabled.isChecked = settings.localControlEnabled
         binding.switchLocalControlPreview.isChecked = settings.localControlPreviewEnabled
         binding.inputLocalControlPort.setText(settings.localControlPort.toString())
@@ -729,6 +859,10 @@ class SettingsActivity : AppCompatActivity() {
             ?: current.ambientPhotoIntervalSeconds
         val presenceWakeCooldown = binding.inputPresenceWakeCooldown.text?.toString()?.trim()?.toIntOrNull()
             ?: current.presenceWakeCooldownSeconds
+        val illuminanceMinDelta = binding.inputIlluminanceMinDelta.text?.toString()?.trim()?.toIntOrNull()
+            ?: current.illuminanceMinDeltaLux
+        val illuminanceDebounce = binding.inputIlluminanceDebounce.text?.toString()?.trim()?.toIntOrNull()
+            ?: current.illuminanceDebounceSeconds
         val localControlPort = binding.inputLocalControlPort.text?.toString()?.trim()?.toIntOrNull()
             ?: current.localControlPort
         val mqttBrokerPort = binding.inputMqttBrokerPort.text?.toString()?.trim()?.toIntOrNull()
@@ -800,6 +934,11 @@ class SettingsActivity : AppCompatActivity() {
             ambientFollowSystemBrightness = binding.switchAmbientFollowSystemBrightness.isChecked,
             presenceWakeEnabled = binding.switchPresenceWake.isChecked,
             presenceWakeCooldownSeconds = presenceWakeCooldown,
+            respectManualScreenOff = binding.switchRespectManualScreenOff.isChecked,
+            deepSleepEnabled = binding.switchDeepSleep.isChecked,
+            illuminanceReportingEnabled = binding.switchIlluminanceReporting.isChecked,
+            illuminanceMinDeltaLux = illuminanceMinDelta,
+            illuminanceDebounceSeconds = illuminanceDebounce,
             mqttEnabled = binding.switchMqttEnabled.isChecked,
             mqttBrokerHost = binding.inputMqttBrokerHost.text?.toString().orEmpty(),
             mqttBrokerPort = mqttBrokerPort,
