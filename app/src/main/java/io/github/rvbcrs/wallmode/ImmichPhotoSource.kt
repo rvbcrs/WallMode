@@ -17,6 +17,8 @@ private val IMMICH_SHARE_PATH = Regex("^/share/([A-Za-z0-9_-]{40,200})/?$")
 private val IMMICH_UUID = Regex(
     "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
 )
+private val IMMICH_TIME_BUCKET = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+private class ImmichHttpException(val status: Int) : IllegalStateException("Immich returned HTTP $status")
 
 fun parseImmichShareUrl(value: String): ImmichShareRef? = runCatching {
     val uri = URI(value.trim())
@@ -48,6 +50,7 @@ object ImmichPhotoSource {
     private const val PAGE_SIZE = 250
     private const val MAX_ASSETS = 1_000
     private const val MAX_PAGES = 20
+    private const val MAX_BUCKETS = 1_000
     private const val MAX_JSON_BYTES = 4 * 1024 * 1024
     private const val MAX_IMAGE_BYTES = 8 * 1024 * 1024
     private const val MAX_IMAGE_DIMENSION = 1280
@@ -69,6 +72,16 @@ object ImmichPhotoSource {
         val albumId = sharedLink.optJSONObject("album")?.optString("id").orEmpty()
         check(IMMICH_UUID.matches(albumId)) { "Immich album ID is invalid" }
 
+        try {
+            loadSearchAssetIds(share, albumId)
+        } catch (error: ImmichHttpException) {
+            // Immich 3 rejects metadata search with public share authentication.
+            if (error.status != HttpURLConnection.HTTP_FORBIDDEN) throw error
+            loadTimelineAssetIds(share, albumId)
+        }
+    }
+
+    private fun loadSearchAssetIds(share: ImmichShareRef, albumId: String): List<String> {
         val ids = linkedSetOf<String>()
         var page = 1
         while (true) {
@@ -107,7 +120,44 @@ object ImmichPhotoSource {
             check(nextPage > page) { "Immich pagination did not advance" }
             page = nextPage
         }
-        ids.toList()
+        return ids.toList()
+    }
+
+    private fun loadTimelineAssetIds(share: ImmichShareRef, albumId: String): List<String> {
+        fun getJson(path: String) = request(
+            share = share,
+            path = path,
+            method = "GET",
+            accept = "application/json",
+            expectedContentType = "application/json",
+            maxBytes = MAX_JSON_BYTES
+        ).toString(StandardCharsets.UTF_8)
+
+        val buckets = JSONArray(getJson("/api/timeline/buckets?albumId=$albumId"))
+        check(buckets.length() <= MAX_BUCKETS) { "Immich timeline exceeded its limit" }
+        val ids = linkedSetOf<String>()
+        for (bucketIndex in 0 until buckets.length()) {
+            val bucket = buckets.getJSONObject(bucketIndex).getString("timeBucket")
+            check(IMMICH_TIME_BUCKET.matches(bucket)) { "Immich returned an invalid time bucket" }
+            val response = JSONObject(getJson("/api/timeline/bucket?albumId=$albumId&timeBucket=$bucket"))
+            val assets = response.getJSONArray("id")
+            val images = response.getJSONArray("isImage")
+            val trashed = response.getJSONArray("isTrashed")
+            check(assets.length() == images.length() && assets.length() == trashed.length()) {
+                "Immich timeline columns have different lengths"
+            }
+            for (index in 0 until assets.length()) {
+                val isImage = images.get(index)
+                val isTrashed = trashed.get(index)
+                check(isImage is Boolean && isTrashed is Boolean) { "Immich returned invalid asset flags" }
+                if (!isImage || isTrashed) continue
+                val id = assets.getString(index)
+                check(IMMICH_UUID.matches(id)) { "Immich returned an invalid asset ID" }
+                ids += id
+                if (ids.size >= MAX_ASSETS) return ids.toList()
+            }
+        }
+        return ids.toList()
     }
 
     fun loadThumbnail(shareUrl: String, assetId: String): Result<Bitmap> = runCatching {
@@ -177,7 +227,7 @@ object ImmichPhotoSource {
                     current = redirected
                     return@repeat
                 }
-                check(responseCode in 200..299) { "Immich returned HTTP $responseCode" }
+                if (responseCode !in 200..299) throw ImmichHttpException(responseCode)
                 check(connection.contentType?.substringBefore(';')?.trim()
                     ?.startsWith(expectedContentType, ignoreCase = true) == true
                 ) { "Immich returned unexpected content" }
